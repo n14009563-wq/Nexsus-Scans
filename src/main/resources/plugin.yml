@@ -1,0 +1,21 @@
+name: NexusScan
+version: '${project.version}'
+main: com.nexuscraft.nexusscan.NexusScanPlugin
+api-version: '1.21'
+author: RealSociety5107
+description: >
+  Tracks every Overworld chunk any player has ever visited, and on a scheduled interval renders
+  them into real isometric 3D-looking tiles (visible height, walls, structure) -- a custom-built
+  renderer in the spirit of Dynmap/BlueMap, no continuous re-render, no live player tracking, just
+  a periodic snapshot a website can display.
+
+commands:
+  nexusscan:
+    description: Manage NexusScan.
+    usage: /nexusscan <status|rescan|reload>
+    aliases: [nscan]
+
+permissions:
+  nexusscan.admin:
+    description: Manage NexusScan (status, force a rescan, reload config).
+    default: op

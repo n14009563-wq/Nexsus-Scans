@@ -1,0 +1,224 @@
+# NexusScan configuration
+#
+# The model here is deliberately the opposite of Dynmap/BlueMap's default behavior: those
+# continuously re-render as the world changes and continuously track/broadcast live player
+# positions. NexusScan does neither -- it just remembers which chunks have EVER been walked
+# into (no player identity or position is kept, only the bare chunk coordinate), and on a
+# schedule takes one flat snapshot of those chunks' surface (top non-air block per column,
+# same idea as a vanilla in-game map) and writes it out as tile images a website can display.
+
+# Which world to scan. Overworld only for now (by design) -- the End and Nether are a planned
+# future update, not this version. Leave as "world" unless your Overworld is named differently.
+world: world
+
+# Read the headers of the world's own region files (world/region/*.mca) on startup to find every
+# chunk that's ever been generated and saved, and seed them into the visited set -- catching up
+# retroactively on exploration that happened before this plugin was ever installed, instead of
+# only recording chunks visited from now on.
+#
+# Default OFF as of v0.4.0: a chunk existing on disk isn't always proof a player explored it --
+# on a server where another plugin also generates/imports terrain programmatically (a world
+# importer, a pregenerator, etc.), this can sweep up every chunk *that plugin* ever touched too,
+# inflating the visited set by orders of magnitude and making every scan take proportionally
+# longer. Run it on demand instead with /nexusscan backfill, which reports the count *before*
+# committing it, so you can sanity-check it first.
+backfill-on-startup: false
+
+# How often (in hours) to re-scan every chunk that's been visited so far and regenerate tiles.
+# This is a full re-scan of the visited set, not an incremental "only what changed" diff -- kept
+# simple on purpose. 24 = once a day. As of v0.4.0 this only controls how often a *new* scan
+# starts -- tiles are pushed to Base44 incrementally throughout each scan (see
+# webhook.push-batch-chunks below), not just once the scan finishes.
+scan-interval-hours: 24
+
+# Run one scan shortly after the server starts (instead of waiting for the first interval to
+# elapse), so there's something to show right away. Delay is in seconds.
+scan-on-startup: true
+startup-scan-delay-seconds: 60
+
+# As of v0.7.0, scanning never forces a synchronous chunk load, never does per-column live block
+# lookups, and never writes files on the main thread -- every chunk goes through an async load
+# (any disk I/O happens off-thread; Paper resumes on the main thread only once it's ready), one
+# cheap snapshot copy is all that touches the main thread per chunk, and the actual rendering +
+# PNG writing happens entirely on a background thread pool (see background-threads below). That
+# means the two settings below -- not a raw chunk count -- are what actually keep this off the
+# server's toes:
+
+# How many milliseconds of a tick's ~50ms budget a scan may spend PER TICK dispatching chunks
+# (kicking off loads/snapshots -- not the actual rendering, which is already on a background
+# thread) before it stops and waits for the next tick. Measured against real elapsed time, so this
+# self-adjusts to whatever else is happening on the server instead of needing per-machine tuning.
+# Lower this (e.g. 1.0) if you still notice any hitching during a scan; 0 disables the time check
+# entirely and falls back to chunks-per-tick alone.
+max-tick-millis: 3.0
+
+# A hard ceiling on how many chunks a single tick will ever dispatch, regardless of
+# max-tick-millis above -- a sanity backstop, not the primary throttle anymore.
+chunks-per-tick: 200
+
+# Size of the background thread pool that does the real per-chunk work (rendering a tile from a
+# chunk snapshot, encoding and writing its PNG) -- entirely off the main thread, since none of it
+# touches Bukkit API. Small by default since this is background work, not something that needs to
+# race the server; raise it on a server with cores to spare if scans feel I/O-bound.
+background-threads: 2
+
+# If a chunk being scanned wasn't already loaded for some other reason (a player nearby, another
+# plugin's loading ticket, etc.), unload it again immediately after reading it. Without this, a
+# scan across millions of visited chunks would leave millions of chunks sitting in memory that
+# nobody actually needs loaded -- its own path to server-wide lag (memory pressure, GC pauses)
+# even with every other optimization above in place. Leave this on unless you have a specific
+# reason not to.
+unload-forced-chunks: true
+
+# Every scan orders the visited chunks by distance from this point (a block X/Z coordinate --
+# world spawn by default) and scans outward from there first, instead of in whatever arbitrary
+# order the visited-chunk set happens to iterate. Combined with the incremental Base44 push above,
+# this means the map that appears on the website fills in as an expanding area centered on spawn,
+# not a scatter of unrelated tiles. This is a fixed reference point, not necessarily the world's
+# live spawn (which can move via /setworldspawn) -- pre-filled with this server's actual spawn.
+scan-origin-x: -16649
+scan-origin-z: 9645
+
+# Where tile PNGs + manifest.json are written, relative to this plugin's data folder
+# (plugins/NexusScan/). This local copy is written regardless of the webhook settings below --
+# useful as a backup/debugging copy even once the push to Base44 is working. Each tile is a PNG
+# (see tile-pixel-size below) named "<chunkX>_<chunkZ>.png" under tiles/<world>/, and
+# manifest.json lists every tile's coordinates plus the overall bounds and last-scan time.
+output-directory: web
+
+# Pixel width/height every tile is rendered at, both the local files above and everything pushed
+# to Base44 below. There's only one color sample per 1x1 block column, so this doesn't add real
+# detail past 16 -- it controls how big a hard-edged (nearest-neighbor, never blurred) upscale of
+# that data gets sent out. A tiny 16x16 source image being stretched up by a browser/website to
+# whatever size it's actually displayed at is the usual cause of a "blurry" looking map -- giving
+# the site a bigger, crisper source image up front means it has to stretch it less (or not at
+# all), and looks far sharper if the site also renders it with nearest-neighbor/"pixelated" image
+# scaling instead of the smooth interpolation browsers use by default. Must be a multiple of 16
+# (blocks per chunk); rounded automatically if not. Bigger = crisper but bigger PNGs -- 64 (4
+# pixels per block) is a reasonable default; go to 128 or 256 for a sharper look if payload size
+# and bandwidth aren't a concern at your visited-chunk count.
+tile-pixel-size: 64
+
+# v1.0.0: which renderer draws each scanned chunk.
+#
+# "isometric" (the default) draws each column as a shaded top face PLUS shaded side wall faces
+# wherever it's taller than its east/south neighbor -- a real isometric-looking map with visible
+# height, cliffs, and structure walls, at the same one-sample-per-column cost the lag-safety work
+# above already accounts for (no extra chunk loads, no extra main-thread work -- only the drawing
+# step changed). This is NOT full voxel ray-casting the way Dynmap/BlueMap render (it still can't
+# show what's under an overhang or inside an open structure, since there's still no data for
+# anything but each column's topmost block) -- but it's a genuinely 3D-looking map, not a flat
+# color swatch.
+#
+# "flat" keeps the older one-flat-color-per-column renderer (with relief-shading below as its only
+# depth cue) -- kept only as a fallback/rollback option.
+rendering-mode: isometric
+
+isometric:
+  # Horizontal pixel unit -- each block's top face is drawn as a diamond 2x this wide and this
+  # tall. Bigger = a larger, crisper (but bigger) tile.
+  pixels-per-block: 6
+
+  # The world Y that maps to the BOTTOM of every tile's height window. This MUST be one fixed value
+  # for the whole map (not derived per-chunk) -- it's what makes neighboring chunks' tiles line up
+  # at the correct relative height instead of each chunk floating at its own arbitrary baseline.
+  # Defaults to vanilla Overworld sea level; if this server's terrain generally sits well above or
+  # below that, moving this closer to the terrain's typical surface height makes better use of the
+  # height window below instead of clamping most columns to one edge of it.
+  baseline-y: 64
+
+  # How many blocks above baseline-y get real vertical room on the canvas. A column below baseline-y
+  # is clamped up to it; a column more than this many blocks above it is clamped down to the top of
+  # the window -- still gets a top face, just with its topmost relief flattened. Raise this if real
+  # terrain is visibly losing relief at the edges of the window; every tile's canvas size grows with
+  # this value (see height-window-blocks in the README for the exact formula).
+  height-window-blocks: 64
+
+  # v1.1.0: draw REAL vanilla block textures (grass, stone, wood grain, etc.) on every top/wall face
+  # instead of BlockColorPalette's flat representative colors. The very first time this is turned on
+  # (and again whenever minecraft-version below changes), NexusScan downloads the plain vanilla
+  # client jar straight from Mojang's own official servers -- the same public version-manifest
+  # endpoint Mojang's own launcher and tools like Dynmap/BlueMap use -- and extracts only the block
+  # texture PNGs from it into plugins/NexusScan/texture-cache/. Nothing is bundled with this plugin;
+  # nothing is redistributed -- it's fetched fresh from Mojang by your own server, once, then cached
+  # on disk for every scan after that. This all happens on a background thread and never blocks
+  # server startup: while it's downloading (or if it ever fails -- no network, a firewall, a typo'd
+  # version), isometric tiles just keep using the flat colors below until it's ready, then switch
+  # over automatically on the next scan. Check /nexusscan status for "Real block textures: ..." to
+  # see which state it's currently in. Grass and leaves use a neutral texture in the real game that's
+  # meant to be tinted per-biome -- NexusScan approximates this with BlockColorPalette's existing
+  # representative color rather than real per-biome tinting. A small number of blocks whose real
+  # texture filename doesn't follow the usual naming convention safely fall back to a flat color
+  # instead of erroring. Set to false to skip all of this and keep the flat-color-per-face look.
+  use-real-textures: true
+
+  # The exact Minecraft version string, spelled the way Mojang's own version manifest spells it
+  # (e.g. "1.21.1", not "1.21"), to fetch block textures for. This SHOULD match the version this
+  # server actually runs closely enough that the block set lines up -- a mismatch doesn't error, it
+  # just means any newer/renamed blocks fall back to a flat color instead of a real texture. Defaults
+  # to the version this plugin was built against.
+  minecraft-version: "1.21.1"
+
+# Legacy flat-renderer settings -- only read when rendering-mode: flat above. A flat, unmodulated
+# color per block (all v0.7.0-v0.9.x did by default) looks like a solid-colored blob with nothing
+# new to see no matter how far you zoom in -- relief shading fixes that cheaply by brightening or
+# darkening a column relative to its west neighbor's height (rising ground = brighter, falling
+# ground = darker), the same basic trick Dynmap/BlueMap's own lightweight "flat" render modes use.
+# Uses only height data already read for that chunk -- no extra chunk loads, no extra main-thread
+# work. One side effect: the very first (west-most) column of every chunk has no west-neighbor data
+# available without loading an adjacent chunk, so it's left unshaded -- a faint, barely-noticeable
+# seam every 16 blocks, traded deliberately for not doubling how many chunks a scan has to touch.
+relief-shading:
+  enabled: true
+  # Brightness change per block of height difference from the west neighbor, e.g. 0.06 = 6%
+  # brighter/darker per block of relative elevation (capped internally so a single sheer cliff
+  # doesn't flash a jarringly bright/dark pixel). Raise for more dramatic-looking terrain relief,
+  # lower for a subtler effect.
+  strength: 0.06
+
+# Pushes each scan's tiles straight to your Base44/Kairos app's ingestWorldTiles webhook, in
+# addition to (not instead of) the local files above. Built to match that webhook's contract
+# exactly: POST {base-url}{path}, JSON body {"manifest": {...}, "tiles": [{z, tx, ty, mime,
+# data_b64}, ...]}, authenticated via the x-kai-secret header.
+webhook:
+  enabled: true
+
+  # Your Base44 app's own domain. Left blank means "skip the push, local files still get written"
+  # (a warning is logged each scan) -- pre-filled here with the real app domain already given.
+  base-url: "https://kai-core-genesis.base44.app"
+
+  # The endpoint path on that app. Matches what was specified; change only if that changes.
+  path: /functions/ingestWorldTiles
+
+  # Shared secret sent in the x-kai-secret header on every push -- MUST exactly match the
+  # KAI_ROSS_WEBHOOK_SECRET secret set in Base44's Secrets settings. Pre-filled with the value
+  # already generated for that secret; change both sides together if you ever rotate it.
+  secret: "117c7e6b6b1c9d360673d36d3c587fafb7648cf68c7ccb8b968a94e7d300c663"
+
+  # The tile pyramid's zoom range, matching ingestWorldTiles' manifest fields -- ONLY used when
+  # rendering-mode: flat above. There's no coarser "zoomed out overview" pyramid for isometric
+  # tiles yet (v1.0.0): every isometric tile is pushed at a single native level (z always 0, one
+  # tile per chunk), addressed by the projection parameters in the pushed manifest instead (see
+  # IsometricManifest in the plugin source / the README) -- the site positions each chunk directly
+  # rather than requesting zoomed-out tiles from a pyramid. max-zoom below is the finest level and
+  # is defined to be exactly one tile per chunk (tile-blocks-base shifted right max-zoom times must
+  # equal 16 -- the default 256 with max-zoom 4 does: 256 >> 4 = 16). Each zoom level below
+  # max-zoom covers 2x the area per tile, built by downsampling groups of 4 finer tiles -- there's
+  # no live re-scan per zoom level, it's all derived from the same chunk scan.
+  min-zoom: 0
+  max-zoom: 4
+  tile-blocks-base: 256
+
+  # How many tiles to send per HTTP request. A large visited area is split across multiple
+  # requests instead of one huge payload; a failed batch just gets resent next scan (the webhook
+  # treats a resend of the same z/tx/ty as an overwrite, so this is safe to retry).
+  tiles-per-request: 200
+
+  # As of v0.4.0: how many successfully-scanned chunks to process before pushing whatever's
+  # changed to Base44, instead of waiting for the whole scan to finish. On a small visited set
+  # this just means everything goes out once, same as before; on a huge one (millions of chunks,
+  # a scan that takes hours) this is what makes a partial, growing map show up on the website
+  # within minutes instead of only after the very last chunk. Lower = the map fills in sooner but
+  # more (small) HTTP requests overall; higher = fewer requests but a longer wait before anything
+  # shows up.
+  push-batch-chunks: 2000
