@@ -1,0 +1,69 @@
+# NexusScan configuration
+#
+# The model here is deliberately the opposite of Dynmap/BlueMap's default behavior: those
+# continuously re-render as the world changes and continuously track/broadcast live player
+# positions. NexusScan does neither -- it just remembers which chunks have EVER been walked
+# into (no player identity or position is kept, only the bare chunk coordinate), and on a
+# schedule takes one flat snapshot of those chunks' surface (top non-air block per column,
+# same idea as a vanilla in-game map) and writes it out as tile images a website can display.
+
+# Which world to scan. Overworld only for now (by design) -- the End and Nether are a planned
+# future update, not this version. Leave as "world" unless your Overworld is named differently.
+world: world
+
+# How often (in hours) to re-scan every chunk that's been visited so far and regenerate tiles.
+# This is a full re-scan of the visited set, not an incremental "only what changed" diff -- kept
+# simple on purpose. 12 = twice a day, 24 = once a day.
+scan-interval-hours: 12
+
+# Run one scan shortly after the server starts (instead of waiting for the first interval to
+# elapse), so there's something to show right away. Delay is in seconds.
+scan-on-startup: true
+startup-scan-delay-seconds: 60
+
+# How many chunks to read per server tick while scanning. Reading a chunk's 256 columns is cheap,
+# but it still has to happen on the main thread (Bukkit's block/chunk API isn't thread-safe), so
+# this spreads a large scan across many ticks instead of doing it all at once and freezing the
+# server. Lower this if you notice lag during a scan; raise it if scans are taking too long to
+# finish on a server with a lot of visited chunks.
+chunks-per-tick: 10
+
+# Where tile PNGs + manifest.json are written, relative to this plugin's data folder
+# (plugins/NexusScan/). This local copy is written regardless of the webhook settings below --
+# useful as a backup/debugging copy even once the push to Base44 is working. Each tile is a
+# 16x16 pixel PNG named "<chunkX>_<chunkZ>.png" under tiles/<world>/, and manifest.json lists
+# every tile's coordinates plus the overall bounds and last-scan time.
+output-directory: web
+
+# Pushes each scan's tiles straight to your Base44/Kairos app's ingestWorldTiles webhook, in
+# addition to (not instead of) the local files above. Built to match that webhook's contract
+# exactly: POST {base-url}{path}, JSON body {"manifest": {...}, "tiles": [{z, tx, ty, mime,
+# data_b64}, ...]}, authenticated via the x-kai-secret header.
+webhook:
+  enabled: true
+
+  # Your Base44 app's own domain. Left blank means "skip the push, local files still get written"
+  # (a warning is logged each scan) -- pre-filled here with the real app domain already given.
+  base-url: "https://kai-core-genesis.base44.app"
+
+  # The endpoint path on that app. Matches what was specified; change only if that changes.
+  path: /functions/ingestWorldTiles
+
+  # Shared secret sent in the x-kai-secret header on every push -- MUST exactly match the
+  # KAI_ROSS_WEBHOOK_SECRET secret set in Base44's Secrets settings. Pre-filled with the value
+  # already generated for that secret; change both sides together if you ever rotate it.
+  secret: "117c7e6b6b1c9d360673d36d3c587fafb7648cf68c7ccb8b968a94e7d300c663"
+
+  # The tile pyramid's zoom range, matching ingestWorldTiles' manifest fields. max-zoom is the
+  # finest level and is defined to be exactly one tile per chunk (tile-blocks-base shifted right
+  # max-zoom times must equal 16 -- the default 256 with max-zoom 4 does: 256 >> 4 = 16). Each
+  # zoom level below max-zoom covers 2x the area per tile, built by downsampling groups of 4 finer
+  # tiles -- there's no live re-scan per zoom level, it's all derived from the same chunk scan.
+  min-zoom: 0
+  max-zoom: 4
+  tile-blocks-base: 256
+
+  # How many tiles to send per HTTP request. A large visited area is split across multiple
+  # requests instead of one huge payload; a failed batch just gets resent next scan (the webhook
+  # treats a resend of the same z/tx/ty as an overwrite, so this is safe to retry).
+  tiles-per-request: 200
